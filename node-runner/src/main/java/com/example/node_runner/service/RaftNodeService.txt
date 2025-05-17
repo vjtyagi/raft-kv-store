@@ -1,0 +1,155 @@
+package com.example.node_runner.service;
+
+import java.io.IOError;
+import java.io.IOException;
+import java.util.Optional;
+
+import org.springframework.stereotype.Service;
+
+import com.example.kvstore.KVStore;
+import com.example.kvstore.command.DeleteCommand;
+import com.example.kvstore.command.PutCommand;
+import com.example.kvstore.statemachine.KVStoreStateMachine;
+import com.example.log.LogManager;
+import com.example.log.PersistentLogManager;
+import com.example.node.RaftNode;
+import com.example.node_runner.config.NodeConfig;
+import com.example.persistence.FilePersistenceManager;
+import com.example.raft.statemachine.StateMachine;
+import com.example.raft.statemachine.StateMachineCommand;
+import com.example.rpc.RaftRpcService;
+import com.example.state.RaftState;
+import com.example.timer.ElectionTimer;
+import com.example.timer.ElectionTimerImpl;
+import com.example.timer.HeartBeatTimer;
+import com.example.timer.HeartBeatTimerImpl;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import lombok.extern.slf4j.Slf4j;
+
+//@Service
+@Slf4j
+public class RaftNodeService {
+    private final NodeConfig config;
+    private final RaftRpcService rpcService;
+    private RaftNode node;
+    private LogManager logManager;
+    private ElectionTimer electionTimer;
+    private HeartBeatTimer heartBeatTimer;
+    private final KVStore kvStore;
+    private StateMachine stateMachine;
+
+    public RaftNodeService(NodeConfig config, RaftRpcService rpcService, KVStore kvStore) {
+        this.config = config;
+        this.rpcService = rpcService;
+        this.kvStore = kvStore;
+    }
+
+    @PostConstruct
+    public void start() throws IOException {
+        this.logManager = new PersistentLogManager(
+                new FilePersistenceManager(config.getStorageDir(), config.getNodeId()));
+        this.electionTimer = new ElectionTimerImpl(config.getElectionTimeoutMs(),
+                config.getElectionTimeoutVarianceMs());
+        this.heartBeatTimer = new HeartBeatTimerImpl(config.getHeartbeatIntervalMs());
+        this.stateMachine = new KVStoreStateMachine(kvStore);
+        this.node = new RaftNode(config.getNodeId(), config.getPeers(), logManager, rpcService, electionTimer,
+                heartBeatTimer, stateMachine);
+
+        node.start();
+        log.info("Started Raft node {} with {} peers", config.getNodeId(), config.getPeers().size());
+    }
+
+    @PreDestroy
+    public void stop() {
+        if (node != null) {
+            node.stop();
+            log.info("Stopped Raft node {}", config.getNodeId());
+        }
+    }
+
+    /**
+     * Get a value from the KV store. Only proceeds if this node is the
+     * leader or forwards to the leader
+     * 
+     * @param key the key to get
+     * @return Optional containing the value if found and node is leader
+     */
+
+    public Optional<String> get(String key) {
+        if (!node.isLeader()) {
+            String leaderId = node.getLeaderId();
+            log.info("Not leader, current leader is: {}", leaderId);
+            return Optional.empty();
+        }
+
+        try {
+            return Optional.ofNullable(kvStore.get(key).getValue());
+        } catch (Exception e) {
+            log.error("Error getting value for key: {}", key, e);
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Put a key-value pair into the store through raft log
+     * 
+     * @param key   the key to put
+     * @param value the value to put
+     * @return true if the command was accepted by the leader
+     */
+    public boolean put(String key, String value) {
+        if (!node.isLeader()) {
+            log.info("Not leader, current leader is: {}", node.getLeaderId());
+            return false;
+        }
+        try {
+            PutCommand command = new PutCommand(key, value);
+            return node.appendCommand(command);
+        } catch (Exception e) {
+            log.error("Error putting value for key: {}", key, e);
+            return false;
+        }
+    }
+
+    /**
+     * Delete a key from the store through the Raft log
+     * 
+     * @param key the key to delete
+     * @return true if the command was accepted by the leader
+     */
+    public boolean delete(String key) {
+        if (!node.isLeader()) {
+            return false;
+        }
+        try {
+            DeleteCommand command = new DeleteCommand(key);
+            return node.appendCommand(command);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // Node status methods
+    public RaftState getState() {
+        return node != null ? node.getState() : null;
+    }
+
+    public String getNodeId() {
+        return config.getNodeId();
+    }
+
+    public boolean isLeader() {
+        return node != null && node.isLeader();
+    }
+
+    public int getCurrentTerm() {
+        return node != null ? node.getCurrentTerm() : -1;
+    }
+
+    public String getLeaderId() {
+        return node != null ? node.getLeaderId() : null;
+    }
+
+}

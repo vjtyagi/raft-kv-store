@@ -1,0 +1,47 @@
+package com.example.cluster.impl;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import com.example.cluster.Cluster;
+import com.example.model.AppendEntriesRequest;
+import com.example.model.AppendEntriesResponse;
+import com.example.model.RequestVoteRequest;
+import com.example.model.RequestVoteResponse;
+import com.example.node.RaftNode3;
+
+public class InMemoryCluster implements Cluster {
+    private final Map<String, RaftNode3> nodeMap = new ConcurrentHashMap<>();
+
+    public void register(String nodeId, RaftNode3 node) {
+        nodeMap.put(nodeId, node);
+    }
+
+    @Override
+    public RequestVoteResponse sendRequestVote(String toNodeId, RequestVoteRequest request) {
+        RaftNode3 target = nodeMap.get(toNodeId);
+        if (target == null) {
+            throw new RuntimeException("Node not found: " + toNodeId);
+        }
+        return target.handleRequestVote(request);
+    }
+
+    @Override
+    public AppendEntriesResponse sendAppendEntries(String to, AppendEntriesRequest req) {
+        RaftNode3 peer = nodeMap.get(to);
+        return peer.handleAppendEntries(req);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        InMemoryCluster cluster = new InMemoryCluster();
+        RaftNode3 node1 = new RaftNode3("node1", List.of("node2", "node3"), cluster);
+        RaftNode3 node2 = new RaftNode3("node2", List.of("node1", "node3"), cluster);
+        RaftNode3 node3 = new RaftNode3("node3", List.of("node1", "node2"), cluster);
+        cluster.register("node1", node1);
+        cluster.register("node2", node2);
+        cluster.register("node3", node3);
+
+        Thread.sleep(5000);
+    }
+}

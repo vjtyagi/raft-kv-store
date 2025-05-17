@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- Console appender for immediate feedback -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    
+    <!-- File appender that captures all logs -->
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <!-- Use system property to specify the log file location -->
+        <file>${LOG_FILE:-logs/application.log}</file>
+        <append>true</append>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS Z} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            <charset>UTF-8</charset>
+            <!-- Use timezone from system's default -->
+            <timeZone>${user.timezone}</timeZone>
+        </encoder>
+    </appender>
+    
+    <!-- Async wrapper for the file appender for better performance -->
+    <appender name="ASYNC" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="FILE" />
+        <queueSize>512</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+    </appender>
+    
+    <!-- Root logger configuration - capture everything -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="ASYNC" />
+    </root>
+    
+    <!-- Package-specific logging levels -->
+    <logger name="com.example" level="DEBUG" />
+    
+</configuration>

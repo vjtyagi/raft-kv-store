@@ -1,0 +1,92 @@
+package com.example.raft;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.util.Collections;
+import java.util.List;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import com.example.cluster.Cluster;
+import com.example.cluster.impl.InMemoryCluster;
+import com.example.model.AppendEntriesRequest;
+import com.example.model.AppendEntriesResponse;
+import com.example.model.RaftLogEntry;
+import com.example.node.RaftNode3;
+import com.example.state.RaftState;
+
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+
+@Getter
+@EqualsAndHashCode
+public class RaftNodeAppendEntriesTest {
+
+    private RaftNode3 node;
+
+    @BeforeEach
+    public void setup() {
+        Cluster dummyCluster = new InMemoryCluster();
+        node = new RaftNode3("node1", Collections.emptyList(), dummyCluster);
+        node.getState().setState(RaftState.FOLLOWER);
+        node.getState().setCurrentTerm(1);
+        node.getLog().clear();
+    }
+
+    @Test
+    public void testHeartbeatAccepted() {
+        AppendEntriesRequest req = new AppendEntriesRequest(1, "leader1", -1, 0, Collections.emptyList(), 0);
+        AppendEntriesResponse resp = node.handleAppendEntries(req);
+        assertTrue(resp.isSuccess());
+        assertEquals(1, resp.getTerm());
+    }
+
+    @Test
+    public void testAppendNewEntry() {
+        RaftLogEntry entry = new RaftLogEntry(0, 1, "set x=1");
+        AppendEntriesRequest req = new AppendEntriesRequest(1, "leader1", -1, 0, List.of(entry), 0);
+        AppendEntriesResponse resp = node.handleAppendEntries(req);
+        assertTrue(resp.isSuccess());
+        assertEquals(1, node.getLog().size());
+        assertEquals("set x=1", node.getLog().get(0).getCommand());
+
+    }
+
+    @Test
+    public void testOverwriteConflictingEntry() {
+        node.getLog().add(new RaftLogEntry(0, 1, "set x=1"));
+        RaftLogEntry newEntry = new RaftLogEntry(0, 2, "set x=2"); // same index, new term
+        AppendEntriesRequest req = new AppendEntriesRequest(2, "leader1", -1, 0, List.of(newEntry), 0);
+        AppendEntriesResponse resp = node.handleAppendEntries(req);
+        assertTrue(resp.isSuccess());
+        assertEquals(1, node.getLog().size());
+        assertEquals("set x=2", node.getLog().get(0).getCommand());
+        assertEquals(2, node.getLog().get(0).getTerm());
+
+    }
+
+    @Test
+    public void testAppendAtEnd() {
+        node.getLog().add(new RaftLogEntry(0, 1, "set x=1"));
+        RaftLogEntry entry = new RaftLogEntry(1, 1, "set y=2");
+        AppendEntriesRequest req = new AppendEntriesRequest(1, "leader1", 0, 1, List.of(entry), 0);
+        AppendEntriesResponse resp = node.handleAppendEntries(req);
+        assertTrue(resp.isSuccess());
+        assertEquals(2, node.getLog().size());
+        assertEquals("set y=2", node.getLog().get(1).getCommand());
+
+    }
+
+    @Test
+    public void testRejectOnMismatchedPrevLogIndex() {
+        node.getLog().add(new RaftLogEntry(0, 1, "set x=1"));
+        RaftLogEntry entry = new RaftLogEntry(2, 1, "set y=2");
+        AppendEntriesRequest req = new AppendEntriesRequest(1, "leader1", 1, 1, List.of(entry), 0);
+        AppendEntriesResponse resp = node.handleAppendEntries(req);
+        assertFalse(resp.isSuccess());
+    }
+
+}

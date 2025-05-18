@@ -8,6 +8,8 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.example.command.ConfigChangeCommand;
+import com.example.command.ConfigChangeCommand.ConfigChangeType;
 import com.example.log.LogManager;
 import com.example.model.AppendEntriesRequest;
 import com.example.model.AppendEntriesResponse;
@@ -21,7 +23,6 @@ import com.example.state.RaftState;
 import com.example.timer.ElectionTimer;
 import com.example.timer.HeartBeatTimer;
 
-import ch.qos.logback.core.util.InterruptUtil;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -51,6 +52,15 @@ public class RaftNode {
     private Map<String, Integer> nextIndex = new HashMap<>(); // For each peer, next log index to send
     private Map<String, Integer> replicationIndex = new HashMap<>(); // for each peer, highest log entry known to be
 
+    // Configuration state for joint consensus
+    private volatile boolean inJointConsensus = false;
+    private volatile List<String> oldConfiguration = null;
+    private volatile List<String> newConfiguration = null;
+
+    // Catch-up tracking for joining nodes
+    private volatile boolean isJoining = false;
+    private volatile boolean isCaughtUp = false;
+
     public RaftNode(String nodeId, List<String> peerIds, LogManager logManager, RaftRpcService rpcService,
             ElectionTimer electionTimer, HeartBeatTimer heartBeatTimer) {
         this(nodeId, peerIds, logManager, rpcService, electionTimer, heartBeatTimer, null);
@@ -73,6 +83,32 @@ public class RaftNode {
         // Register RPC handlers
         this.rpcService.registerRequestVoteHandler(this::handleRequestVote);
         this.rpcService.registerAppendEntriesHandler(this::handleAppendEntries);
+    }
+
+    /**
+     * Mark this node as joining the cluster
+     * This will prevent node from voting until it's caught up
+     * 
+     */
+    public void setJoining(boolean joining) {
+        this.isJoining = joining;
+        this.isCaughtUp = !isJoining;
+    }
+
+    public void setCaughtUp(boolean caughtUp) {
+        this.isCaughtUp = caughtUp;
+    }
+
+    public boolean isJoining() {
+        return isJoining;
+    }
+
+    public boolean isCaughtUp() {
+        return isCaughtUp;
+    }
+
+    public boolean isInJointConsensus() {
+        return inJointConsensus;
     }
 
     public Map<String, Integer> getNextIndex() {
@@ -195,9 +231,16 @@ public class RaftNode {
      * Transitions to candidate state and starts a new election
      */
     private void onElectionTimeout() {
-        System.out.println(nodeId + ": Election timeout occurred in state " + state);
+
         log.info("{}: Election timeout occurred in state {}, current term: {}",
                 nodeId, state, getCurrentTerm());
+
+        if (isJoining && !isCaughtUp) {
+            log.info("{}: Node is joining and not caught up, ignoring election timeout", nodeId);
+            electionTimer.reset();
+            return;
+        }
+
         if (state != RaftState.LEADER) {
             log.debug("{}: Starting election due to timeout", nodeId);
             transitionTo(RaftState.CANDIDATE);
@@ -233,7 +276,7 @@ public class RaftNode {
         final int lastLogTerm = logManager.getLastLogTerm();
         RequestVoteRequest request = new RequestVoteRequest(currentTerm, nodeId, lastLogIndex, lastLogTerm);
         // Send RequestVote RPCs to all peers
-        for (String peerId : peerIds) {
+        for (String peerId : getPeersForVoting()) {
             CompletableFuture<RequestVoteResponse> future = rpcService.sendRequestVote(peerId, request);
             future.thenAccept(response -> processVoteResponse(peerId, response))
                     .exceptionally(e -> {
@@ -243,6 +286,33 @@ public class RaftNode {
                         return null;
                     });
         }
+    }
+
+    private List<String> getPeersForVoting() {
+        if (!inJointConsensus) {
+            return peerIds;
+        } else {
+            // In joint consensus, we need to send all peers in both configuration
+
+            List<String> allPeers = new ArrayList<>();
+            if (oldConfiguration != null) {
+                for (String peer : oldConfiguration) {
+                    if (!peer.equals(nodeId) && !allPeers.contains(peer)) {
+                        allPeers.add(peer);
+                    }
+                }
+            }
+            if (newConfiguration != null) {
+                for (String peer : newConfiguration) {
+                    if (!peer.equals(nodeId) && !allPeers.contains(peer)) {
+                        allPeers.add(peer);
+                    }
+                }
+            }
+
+            return allPeers;
+        }
+
     }
 
     private synchronized void processVoteResponse(String peerId, RequestVoteResponse response) {
@@ -273,17 +343,35 @@ public class RaftNode {
         // Count vote if granted
         if (response.isVoteGranted()) {
             int votes = voteCount.incrementAndGet();
-            int totalNodes = peerIds.size() + 1;
-            int majority = (totalNodes / 2) + 1;
-            log.info("{}: Received vote from {} in term {}, vote count: {}/{} for majority",
-                    nodeId, peerId, currentTerm, votes, majority);
-            System.out.println(nodeId + ": vote count is now " + votes + "(need majority) + " + " for majority");
+            // int totalNodes = peerIds.size() + 1;
+            // int majority = (totalNodes / 2) + 1;
+            // log.info("{}: Received vote from {} in term {}, vote count: {}/{} for
+            // majority",
+            // nodeId, peerId, currentTerm, votes, majority);
+            // System.out.println(nodeId + ": vote count is now " + votes + "(need majority)
+            // + " + " for majority");
             // If majority, become leader
-            if (votes >= majority) {
+            if (hasMajority(votes)) {
                 transitionTo(RaftState.LEADER);
             }
         } else {
             log.debug("{}: Vote denied by {} in term {}", nodeId, peerId, currentTerm);
+        }
+    }
+
+    private boolean hasMajority(int votes) {
+        if (!inJointConsensus) {
+            int majority = (peerIds.size() + 1) / 2 + 1;
+            log.debug("{}: vote count is now {} need {} for majority", nodeId, votes, majority);
+            return votes >= majority;
+        } else {
+            // In joint consensus - need majority in both old and new configuration
+            int oldConfigSize = oldConfiguration.size();
+            int newConfigSize = newConfiguration.size();
+            int oldMajority = oldConfigSize / 2 + 1;
+            int newMajority = newConfigSize / 2 + 1;
+            return votes >= oldMajority && votes >= newMajority;
+
         }
     }
 
@@ -296,7 +384,10 @@ public class RaftNode {
         this.leaderId = nodeId;
         // Initializes nextIndex and matchIndex for all peers
         int nextIdx = logManager.getLastLogIndex() + 1;
-        for (String peerId : peerIds) {
+
+        List<String> allPeers = getPeersForVoting();
+
+        for (String peerId : allPeers) {
             nextIndex.put(peerId, nextIdx);
             replicationIndex.put(peerId, 0);
         }
@@ -314,10 +405,11 @@ public class RaftNode {
                     nodeId, state);
             return;
         }
-        System.out.println(nodeId + ": SENDING HEARTBEATS for term " + currentTerm);
+
         log.debug("{}: Sending heartbeats to {} peers for term {}",
                 nodeId, peerIds.size(), currentTerm);
-        for (String peerId : peerIds) {
+        List<String> allPeers = getPeersForVoting();
+        for (String peerId : allPeers) {
             sendAppendEntries(peerId);
         }
     }
@@ -326,16 +418,19 @@ public class RaftNode {
      * Send AppendEntries RPC to a specific peer
      */
     private void sendAppendEntries(String peerId) {
-        // System.out.println("Sending appendEntries for " + peerId);
+
+        if (!nextIndex.containsKey(peerId)) {
+            int lastIdx = logManager.getLastLogIndex();
+            log.warn("{}: Adding missing nextIndex for {} to {}", nodeId, peerId, lastIdx + 1);
+            nextIndex.put(peerId, lastIdx + 1);
+            replicationIndex.put(peerId, 0);
+        }
+
         int currentTerm = getCurrentTerm();
         int prevLogIndex = nextIndex.get(peerId) - 1;
         int prevLogTerm = prevLogIndex >= 0 ? logManager.getLogEntryTerm(prevLogIndex) : 0;
         int peerNextIndex = nextIndex.get(peerId);
-        int peerReplicationIndex = replicationIndex.get(peerId);
-        if (peerReplicationIndex == 0 && peerNextIndex > 1) {
-            peerNextIndex = 0;
-            nextIndex.put(peerId, 0);
-        }
+
         // Get entries to send
         List<RaftLogEntry> entries = logManager.getEntriesFrom(nextIndex.get(peerId));
         log.debug("{}: Sending {} entries to {} starting at index {} (prevLogIndex={})",
@@ -425,21 +520,10 @@ public class RaftNode {
             System.out.println("Checking n=" + n);
             // Only commit log entries from currentTerm
             if (logManager.getLogEntryTerm(n) != currentTerm) {
-                System.out.println("Skipping n=" + n + " (wrong term)");
                 continue;
             }
-            int count = 1; // count self
-            for (String peerId : peerIds) {
-                if (replicationIndex.get(peerId) >= n) {
-                    count++;
-                    System.out.println(peerId + " has replicated n=" + n);
-                }
-            }
-            System.out.println("n=" + n + ", count=" + count + ", majority=" + ((peerIds.size() / 2) + 1));
-            int totalNodes = peerIds.size() + 1;
-            int majority = totalNodes / 2 + 1;
 
-            if (count >= majority) {
+            if (countNodesWithLogIndex(n) >= getMajoritySize()) {
                 // majority has this replicationIndex(n)
                 System.out.println("COMMITTING n=" + n);
                 commitIndex = n;
@@ -450,6 +534,66 @@ public class RaftNode {
             }
         }
         System.out.println("Final commitIndex=" + commitIndex);
+    }
+
+    /**
+     * 
+     * Count the number of nodes(including self) that have replicated upto the given
+     * log index
+     * Handles joint consensus configurations
+     */
+    private int countNodesWithLogIndex(int logIndex) {
+        int count = 1; // count self;
+        if (!inJointConsensus) {
+            for (String peerId : peerIds) {
+                if (replicationIndex.getOrDefault(peerId, 0) >= logIndex) {
+                    count++;
+                }
+            }
+            return count;
+        } else {
+            // For joint consensus, we need separate counts for each configuration
+            Map<String, Boolean> counted = new HashMap<>();
+
+            // Count nodes in old configuration
+            int oldCount = oldConfiguration.contains(nodeId) ? 1 : 0;
+            for (String peerId : oldConfiguration) {
+                if (!peerId.equals(nodeId) && replicationIndex.getOrDefault(peerId, 0) >= logIndex) {
+                    oldCount++;
+                    counted.put(peerId, true);
+                }
+            }
+
+            // count nodes in new configuration
+            int newCount = newConfiguration.contains(nodeId) ? 1 : 0;
+            for (String peerId : newConfiguration) {
+                if (!peerId.equals(nodeId) && replicationIndex.getOrDefault(peerId, 0) >= logIndex) {
+                    if (!counted.containsKey(peerId)) {
+                        newCount++;
+                    }
+                }
+            }
+            // check if we have majority in both configurations
+            int oldMajority = oldConfiguration.size() / 2 + 1;
+            int newMajority = newConfiguration.size() / 2 + 1;
+            if (oldCount >= oldMajority && newCount >= newMajority) {
+                return Math.max(oldCount, newCount);
+            } else {
+                return 0;// not enough for joint consensus
+            }
+        }
+
+    }
+
+    private int getMajoritySize() {
+        if (!inJointConsensus) {
+            return (peerIds.size() + 1) / 2 + 1;
+        } else {
+            // for joint consensus we need max of both majorities
+            int oldMajority = oldConfiguration.size() / 2 + 1;
+            int newMajority = newConfiguration.size() / 2 + 1;
+            return Math.max(oldMajority, newMajority);
+        }
     }
 
     /**
@@ -464,15 +608,87 @@ public class RaftNode {
             // entry.getCommand());
             if (stateMachine != null) {
                 try {
-                    StateMachineCommand command = stateMachine.deserializeCommand(entry.getCommand());
-                    boolean success = stateMachine.apply(command);
-                    if (!success) {
-                        log.error("Failed to apply command at index: {}", lastApplied);
+                    String serialized = entry.getCommand();
+                    StateMachineCommand command = null;
+                    if (serialized.startsWith("CONFIG_CHANGE")) {
+                        command = ConfigChangeCommand.deserialize(serialized);
+                        applyConfigChangeCommand((ConfigChangeCommand) command);
+                    } else {
+                        command = stateMachine.deserializeCommand(entry.getCommand());
+                        boolean success = stateMachine.apply(command);
+                        if (!success) {
+                            log.error("Failed to apply command at index: {}", lastApplied);
+                        }
                     }
+
                 } catch (IllegalArgumentException e) {
                     log.error("Failed to deserialize command at index: {}", lastApplied, e);
                 } catch (Exception e) {
                     log.error("Error applying command at index: {}", lastApplied, e);
+                }
+            }
+        }
+    }
+
+    private void applyConfigChangeCommand(ConfigChangeCommand command) {
+        ConfigChangeType type = command.getType();
+        if (type == ConfigChangeType.JOINT) {
+            // Enter joint consensus
+            log.info("{}: Entering joint consensus - old: {}, new: {}", nodeId, command.getOldConfig(),
+                    command.getNewConfig());
+            oldConfiguration = new ArrayList<>(command.getOldConfig());
+            newConfiguration = new ArrayList<>(command.getNewConfig());
+            inJointConsensus = true;
+
+            // A new node becomes caught up when it sees the joint consensus entry
+            if (isJoining && newConfiguration.contains(nodeId) && !oldConfiguration.contains(nodeId)) {
+                log.info("{}: node is now caught up and part of joint configuration", nodeId);
+                isCaughtUp = true;
+            }
+            // if we're the leader update nextIndex and replciationIndex for any new peers
+            if (state == RaftState.LEADER) {
+                int nextIdx = logManager.getLastLogIndex() + 1;
+                for (String peerId : newConfiguration) {
+                    if (!peerId.equals(nodeId) && !oldConfiguration.contains(peerId)
+                            && !nextIndex.containsKey(peerId)) {
+                        log.info("{}: Initializing nextIndex for new peer {} to {}", nodeId, peerId, nextIdx);
+                        if (!nextIndex.containsKey(peerId)) {
+                            nextIndex.put(peerId, nextIdx);
+                            replicationIndex.put(peerId, 0);
+                        }
+                    }
+
+                }
+            }
+        } else if (type == ConfigChangeType.FINAL) {
+            log.info("{}: switching to final configuration: {}", nodeId, command.getNewConfig());
+
+            // update peer list
+            List<String> newPeers = new ArrayList<>();
+            for (String peer : command.getNewConfig()) {
+                if (!peer.equals(nodeId)) {
+                    newPeers.add(peer);
+                }
+            }
+            this.peerIds = newPeers;
+            this.inJointConsensus = false;
+            this.oldConfiguration = null;
+            this.newConfiguration = null;
+
+            // if this node was joining and is now in final configuration
+            // it's done joining
+            if (isJoining && command.getNewConfig().contains(nodeId)) {
+                log.info("{}: node successfully joined in final configuration", nodeId);
+                isJoining = false;
+            }
+            // if we're the leader update nextIndex and replciationIndex for any new peers
+            if (state == RaftState.LEADER) {
+                int nextIdx = logManager.getLastLogIndex() + 1;
+                for (String peerId : peerIds) {
+                    if (!nextIndex.containsKey(peerId)) {
+                        nextIndex.put(peerId, nextIdx);
+                        replicationIndex.put(peerId, 0);
+                    }
                 }
             }
         }
@@ -522,8 +738,12 @@ public class RaftNode {
      */
     public RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
         int currentTerm = getCurrentTerm();
-        System.out.println(
-                nodeId + ": Received RequestVote from " + request.getCandidateId() + " for term " + request.getTerm());
+
+        if (isJoining && !isCaughtUp) {
+            log.info("{} node is joining and not caught up, denying vote to {}", nodeId, request.getCandidateId());
+            return new RequestVoteResponse(currentTerm, false);
+        }
+
         if (request.getTerm() > currentTerm) {
             log.info("{}: Updating term from {} to {} due to vote request",
                     nodeId, logManager.getCurrentTerm(), request.getTerm());

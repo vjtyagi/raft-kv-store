@@ -290,46 +290,77 @@ start_new_node() {
 }
 
 add_node_to_cluster(){
-    echo "=== Adding node3 to cluster ==="
+    echo "=== Adding node3 to cluster using joint consensus ==="
 
-    
-    echo "Bootstrapping node3's peerlist"
-    local bootstrap_response=$(curl -s -w "%{http_code}" -o /tmp/bootstrap_node3 \
+    echo "Setting node3 to joining state"
+
+    local join_state_response=$(curl -s -w "%{http_code}" -o /tmp/join_state_response \
         -X POST \
-        -H "Content-Type: application/json" \
-        -d '{"peers": ["node1", "node2"]}' \
-        "$BASE_URL:$NODE3_PORT/api/v1/cluster/bootstrap-peers")
-
-    if [ "$bootstrap_response" = "200" ]; then
-        echo "Successfully bootstrapped node3's peer list"
+        "$BASE_URL:$NODE3_PORT/api/v1/cluster/start-join")
+    
+    if [ "$join_state_response" = "200" ]; then
+        echo "Sucessfully set node3 to joining state"
+        echo "Response: $(cat /tmp/join_state_response)"
     else
-        echo "Failed to bootstrap node3's peer list (HTTP: $bootstrap_response)"
+        echo "Failed to set node3 to joining state (HTTP: $join_state_response)"
+        echo "Error: $(cat /tmp/join_state_response 2>/dev/null)"
         return 1
     fi
 
 
-    # Step 1: adding node3 to cluster via leader
-    echo "Adding node3 to existing cluster via leader ($CURRENT_LEADER)"
-    local add_response=$(curl -s -w "%{http_code}" -o /tmp/add_node_response \
+
+    # echo "Bootstrapping node3's peerlist"
+    # local bootstrap_response=$(curl -s -w "%{http_code}" -o /tmp/bootstrap_node3 \
+    #     -X POST \
+    #     -H "Content-Type: application/json" \
+    #     -d '{"peers": ["node1", "node2"]}' \
+    #     "$BASE_URL:$NODE3_PORT/api/v1/cluster/bootstrap-peers")
+
+    # if [ "$bootstrap_response" = "200" ]; then
+    #     echo "Successfully bootstrapped node3's peer list"
+    # else
+    #     echo "Failed to bootstrap node3's peer list (HTTP: $bootstrap_response)"
+    #     return 1
+    # fi
+
+    # Initiate join process through leader using /join endpoint
+    echo "Initiating joint consensus process via leader ($CURRENT_LEADER)"
+    local join_response=$(curl -s -w "%{http_code}" -o /tmp/join_response \
         -X POST \
         -H "Content-Type: application/json" \
-        -d '{"nodeId": "node3"}' \
-        "$BASE_URL:$LEADER_PORT/api/v1/cluster/add-node")
-    
-    if [ "$add_response" = "200" ]; then
-        echo "Successfully added node3 to cluster's peer list"
-        echo "Response : $(cat /tmp/add_node_response)"
-    else
-        echo "Failed to add node3 to cluster (HTTP: $add_response)"
-        echo "Error: $(cat /tmp/add_node_response 2>/dev/null)"
+        -d "{\"nodeId\" : \"node3\",  \"lastLogIndex\": -1}" \
+        "$BASE_URL:$LEADER_PORT/api/v1/cluster/join")
+    if [ "$join_response" = "200" ]; then
+        echo "Successfully initiated joint consensus process"
+    else 
+        echo "Failed to initiate joint consensus process (HTTP: $join_response)"
         return 1
     fi
+
+    echo "Wait for joint consensus process to complete (10s to allow for both phases)"
+    sleep 10
+    
+
+    # # Step 1: adding node3 to cluster via leader
+    # echo "Adding node3 to existing cluster via leader ($CURRENT_LEADER)"
+    # local add_response=$(curl -s -w "%{http_code}" -o /tmp/add_node_response \
+    #     -X POST \
+    #     -H "Content-Type: application/json" \
+    #     -d '{"nodeId": "node3"}' \
+    #     "$BASE_URL:$LEADER_PORT/api/v1/cluster/add-node")
+    
+    # if [ "$add_response" = "200" ]; then
+    #     echo "Successfully added node3 to cluster's peer list"
+    #     echo "Response : $(cat /tmp/add_node_response)"
+    # else
+    #     echo "Failed to add node3 to cluster (HTTP: $add_response)"
+    #     echo "Error: $(cat /tmp/add_node_response 2>/dev/null)"
+    #     return 1
+    # fi
 
    
 
-    echo "Wait for cluster membership changes to propagate"
-    sleep 3
-
+    
     #Step 4: Verifying cluster membership
 
     #Check leader's view for cluster
@@ -348,12 +379,15 @@ add_node_to_cluster(){
     local node3_log_size=$(echo "$node3_debug" | grep -o '"logSize":[0-9]*' | cut -d':' -f2)
 
     echo "Node3 Raft State: $node3_state"
-    echo "Node3 log size: $node3_log_size ( should be 0 initially )"
+    
+    return 0
 }
 
 monitor_replication_progress(){
     echo "Monitory node3 replication progress"
-    echo "Target: Log=$BASELINE_LOG_SIZE, Commit=$BASELINE_COMMIT_INDEX, Term=$BASELINE_CURRENT_TERM"
+    local expected_entries=$((BASELINE_LOG_SIZE+2))
+    local expected_commit=$((BASELINE_COMMIT_INDEX+2))
+    echo "Target: Log=$expected_entries, Commit=$expected_commit, Term=$BASELINE_CURRENT_TERM"
 
     local max_wait=60
     local elapsed=0
@@ -364,11 +398,15 @@ monitor_replication_progress(){
             local log_size=$(echo "$debug" | grep -o '"logSize":[0-9]*' | cut -d':' -f2)
             local commit_index=$(echo "$debug" | grep -o '"commitIndex":[0-9-]*' | cut -d':' -f2)
             local term=$(echo "$debug" | grep -o '"currentTerm":[0-9]*' | cut -d':' -f2)
-            echo "[$elapsed s] Node3: Log=$log_size/$BASELINE_LOG_SIZE, Commit=$commit_index/$BASELINE_COMMIT_INDEX, Term=$term/$BASELINE_CURRENT_TERM"
+            local is_joining=$(echo "$debug" | jq -r '.nodeState.isJoining' 2>/dev/null || echo "unknown")
+            local is_caught_up=$(echo "$debug" | jq -r '.nodeState.isCaughtUp' 2>/dev/null || echo "unknown")
+            echo "[$elapsed s] Node3: Log=$log_size/$expected_entries, Commit=$commit_index/$expected_commit, Term=$term/$BASELINE_CURRENT_TERM"
+            echo "[$elapsed s] Node3: Joining=$is_joining, CaughtUp=$is_caught_up"
 
-            if [ "$log_size" = "$BASELINE_LOG_SIZE" ] && \
-               [ "$commit_index" = "$BASELINE_COMMIT_INDEX" ] && \
-               [ "$term" = "$BASELINE_CURRENT_TERM" ]; then
+            if [ "$log_size" = "$expected_entries" ] && \
+               [ "$commit_index" = "$expected_commit" ] && \
+               [ "$term" = "$BASELINE_CURRENT_TERM" ] && \
+               [ "$is_joining" = "false" ]; then
                echo "Success Node3 caught up in ${elapsed}s"
                return 0
             fi

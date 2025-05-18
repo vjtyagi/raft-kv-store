@@ -66,8 +66,9 @@ public class ElectionTimerImpl implements ElectionTimer {
     }
 
     private int calculateRandomTimeout() {
-        int variance = random.nextInt(2 * timeoutVarianceMs) - timeoutVarianceMs;
-        return baseTimeoutMs + variance;
+        int timeout = baseTimeoutMs + random.nextInt(timeoutVarianceMs);
+        log.debug("Calculated election timeout: {}ms", timeout);
+        return timeout;
     }
 
     /**

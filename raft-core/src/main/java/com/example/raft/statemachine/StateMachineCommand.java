@@ -1,5 +1,7 @@
 package com.example.raft.statemachine;
 
+import com.example.command.ConfigChangeCommand;
+
 public interface StateMachineCommand {
     /**
      * Serialize command to string for storage in Raft Log

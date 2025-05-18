@@ -85,7 +85,16 @@ public class DebugController {
                 kvInfo.put("available", false);
                 kvInfo.put("reason", "StateMachine is not KVStoreStateMachine");
             }
+
             debugInfo.put("kvState", kvInfo);
+
+            // Joining and JointConsensus state
+            Map<String, Object> nodeState = new HashMap<>();
+            nodeState.put("isJoining", raftNode.isJoining());
+            nodeState.put("isCaughtUp", raftNode.isCaughtUp());
+            nodeState.put("inJointConsensus", raftNode.isInJointConsensus());
+            debugInfo.put("nodeState", nodeState);
+
             debugInfo.put("success", true);
 
         } catch (Exception e) {

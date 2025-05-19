@@ -1,0 +1,70 @@
+services:
+  node1:
+    build:
+      context: .
+    ports:
+      - "8081:8080"
+    environment:
+      - NODE_ID=node1
+      - PEERS=node2
+      - STORAGE_DIR=/data/raft
+      - CLIENT_PORT=8080
+      - RPC_PORT=9090
+      - LOGGING_LEVEL_COM_EXAMPLE=DEBUG
+      - LOG_FILE=/app/logs/node1.log
+      - TZ=Asia/Kolkata
+    volumes:
+      - ./data/raft/node1:/data/raft
+      - ./logs:/app/logs
+    networks:
+      - raft-network
+
+  node2:
+    build:
+      context: .
+    ports:
+      - "8082:8080"
+    environment:
+      - NODE_ID=node2
+      - PEERS=node1
+      - STORAGE_DIR=/data/raft
+      - CLIENT_PORT=8080
+      - RPC_PORT=9090
+      - LOGGING_LEVEL_COM_EXAMPLE=DEBUG
+      - LOG_FILE=/app/logs/node2.log
+      - TZ=Asia/Kolkata
+
+    volumes:
+      - ./data/raft/node2:/data/raft
+      - ./logs:/app/logs
+    networks:
+      - raft-network
+
+  node3:
+    build:
+      context: .
+    ports:
+      - "8083:8080"
+    environment:
+      - NODE_ID=node3
+      - PEERS=
+      - STORAGE_DIR=/data/raft
+      - CLIENT_PORT=8080
+      - RPC_PORT=9090
+      - LOGGING_LEVEL_COM_EXAMPLE=DEBUG
+      - LOG_FILE=/app/logs/node3.log
+      - TZ=Asia/Kolkata
+
+    volumes:
+      - ./data/raft/node3:/data/raft
+      - ./logs:/app/logs
+    networks:
+      - raft-network
+
+networks:
+  raft-network:
+    driver: bridge
+volumes:
+  raft-data-node1:
+  raft-data-node2:
+  raft-data-node3:

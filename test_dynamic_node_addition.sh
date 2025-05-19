@@ -10,24 +10,24 @@ BASE_URL="http://localhost"
 start_initial_cluster() {
     echo "==== Starting initial 2-Node cluster ==="
     echo "Stopping any existing cluster...."
-    docker compose down
+    docker compose -f docker-compose-addition.yml down
 
     echo "cleaning up old data..."
     rm -rf ./data/raft/*
     rm -rf ./logs/*
 
     echo "Building images..."
-    docker compose build
+    docker compose -f docker-compose-addition.yml build
 
     echo "Starting node1..."
-    docker compose up -d node1
-    docker compose up -d node2
+    docker compose -f docker-compose-addition.yml up -d node1
+    docker compose -f docker-compose-addition.yml up -d node2
 
     echo "Waiting for nodes to initialize..."
     sleep 5
 
     echo "Initial 2-node cluster started"
-    docker compose ps
+    docker compose -f docker-compose-addition.yml ps
 
 
 }
@@ -260,7 +260,7 @@ start_new_node() {
     
     # Start node3 with Docker Compose
     echo "Starting node3..."
-    docker compose up -d node3
+    docker compose -f docker-compose-addition.yml up -d node3
     
     echo "Waiting for node3 to initialize..."
     sleep 5

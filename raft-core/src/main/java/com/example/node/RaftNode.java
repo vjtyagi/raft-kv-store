@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import com.example.command.ConfigChangeCommand;
@@ -61,6 +62,10 @@ public class RaftNode {
     private volatile boolean isJoining = false;
     private volatile boolean isCaughtUp = false;
 
+    private final NodeFailureDetector nodeFailureDetector;
+    private static final int NODE_FAILURE_THRESHOLD = 10;
+    private final Map<String, Boolean> removalInProgress = new ConcurrentHashMap<>();
+
     public RaftNode(String nodeId, List<String> peerIds, LogManager logManager, RaftRpcService rpcService,
             ElectionTimer electionTimer, HeartBeatTimer heartBeatTimer) {
         this(nodeId, peerIds, logManager, rpcService, electionTimer, heartBeatTimer, null);
@@ -83,6 +88,111 @@ public class RaftNode {
         // Register RPC handlers
         this.rpcService.registerRequestVoteHandler(this::handleRequestVote);
         this.rpcService.registerAppendEntriesHandler(this::handleAppendEntries);
+        this.nodeFailureDetector = new NodeFailureDetector(NODE_FAILURE_THRESHOLD, this::handleNodeFailure);
+    }
+
+    /**
+     * Handles detected node failure by initiating it's removal from the cluster
+     * This is called by NodeFailureDetector when a node reaches the failure
+     * threshold
+     * 
+     */
+    private void handleNodeFailure(String failedNodeId) {
+        if (state != RaftState.LEADER) {
+            log.warn("{}, Ignoring node failure for {} as we're not the leader", nodeId, failedNodeId);
+            return;
+        }
+        log.warn("{} Handling node failure for {}, initiating removal process", nodeId, failedNodeId);
+        initiateNodeRemoval(failedNodeId);
+    }
+
+    private boolean initiateNodeRemoval(String nodeToRemove) {
+        try {
+            if (removalInProgress.putIfAbsent(nodeToRemove, true) != null) {
+                log.info("{}: Removal of {} already in progress, ignoring duplicate request", nodeId, nodeToRemove);
+                return false;
+            }
+            if (!peerIds.contains(nodeToRemove)) {
+                log.warn("{} cannot remove {} as it's not in peer list", nodeId, nodeToRemove);
+                return false;
+            }
+            // Get current configuration(all nodes including leader)
+            List<String> oldConfig = new ArrayList<>(peerIds);
+            oldConfig.add(nodeId);
+
+            // Create new configuration without failed node
+            List<String> newConfig = new ArrayList<>();
+            for (String peer : oldConfig) {
+                if (!peer.equals(nodeToRemove)) {
+                    newConfig.add(peer);
+                }
+            }
+
+            // Check if removal would break quorum
+            int oldQuorum = (oldConfig.size() / 2) + 1;
+            int newQuorum = (newConfig.size() / 2) + 1;
+            if (newConfig.size() < oldQuorum) {
+                log.error("{} cannot remove {} at it would break quorum need {} node for majority", nodeId,
+                        nodeToRemove, oldQuorum);
+                return false;
+            }
+
+            log.info("{} Initiating joing consensus to remove node {} - Old: {}, New: {}", nodeId, nodeToRemove,
+                    oldConfig, newConfig);
+            ConfigChangeCommand jointCommand = new ConfigChangeCommand(
+                    ConfigChangeType.JOINT, oldConfig, newConfig);
+
+            // Append command to log
+            boolean successs = appendCommand(jointCommand);
+
+            if (successs) {
+                log.info("{} successfully initiated JOINT configuration to remove node {}", nodeId, nodeToRemove);
+                Thread.ofVirtual().start(() -> {
+                    try {
+                        int jointConfigIndex = logManager.getLastLogIndex();
+                        log.info("{}: Joint Config entry is at index {}, waiting for it to commit", nodeId,
+                                jointConfigIndex);
+                        long startTime = System.currentTimeMillis();
+
+                        while (isLeader() && commitIndex < jointConfigIndex) {
+                            Thread.sleep(100);
+                            if (System.currentTimeMillis() - startTime > 10000) {
+                                log.warn("{}: Timeout waiting for joint config to commit", nodeId);
+                                break;
+                            }
+                        }
+
+                        if (!isLeader()) {
+                            log.warn("{} no longer leader, abandoning final config for removal of ", nodeId,
+                                    nodeToRemove);
+                            return;
+                        }
+                        log.info("{}: Proceeding to final configuration", nodeId);
+                        ConfigChangeCommand finalCommand = new ConfigChangeCommand(
+                                ConfigChangeType.FINAL, null, newConfig);
+                        Thread.sleep(10);
+                        boolean finalSuccess = appendCommand(finalCommand);
+                        if (finalSuccess) {
+                            log.info("{}: Successfully completed removal of node {}", nodeId, nodeToRemove);
+                            removalInProgress.remove(nodeToRemove);
+                        } else {
+                            log.error("{} failed to append FINAL configuration for removal of {}", nodeId,
+                                    nodeToRemove);
+                        }
+                    } catch (Exception e) {
+                        log.error("{} Error during final configuration for removal of {}", nodeId, nodeToRemove, e);
+                    }
+                });
+                return true;
+            } else {
+                log.error("{} failed to append JOINT configuration for removal of {}", nodeId, nodeToRemove);
+                return false;
+            }
+
+        } catch (Exception e) {
+            log.error("{} Error initiating removal of node {}", nodeId, nodeToRemove, e);
+            return false;
+        }
     }
 
     /**
@@ -194,6 +304,8 @@ public class RaftNode {
                 break;
             case LEADER:
                 // stop heartbeats
+                this.leaderId = null;
+                log.info("{}: Stopping heartbeat timer when stepping down from leader", nodeId);
                 heartBeatTimer.stop();
                 break;
 
@@ -202,7 +314,9 @@ public class RaftNode {
         }
         state = newState;
         System.out.println(nodeId + " State: " + state);
-
+        if (oldState == RaftState.LEADER && newState != RaftState.LEADER) {
+            nodeFailureDetector.resetAllCounters();
+        }
         // initialize new state
         switch (newState) {
             case FOLLOWER:
@@ -217,6 +331,7 @@ public class RaftNode {
             case LEADER:
                 // Become leader
                 this.leaderId = nodeId;
+                nodeFailureDetector.resetAllCounters();
                 becomeLeader();
                 break;
 
@@ -257,14 +372,7 @@ public class RaftNode {
         logManager.incrementCurrentTerm();
         logManager.saveVotedFor(nodeId);
         voteCount.set(1);
-        // if (peerIds.isEmpty()) {
-        // System.out.println(nodeId + ": single-node cluster, becoming leader
-        // immediately");
-        // log.debug("single-node cluster, {nodeId} becoming leader immediately",
-        // nodeId);
-        // transitionTo(RaftState.LEADER);
-        // return;
-        // }
+
         int currentTerm = getCurrentTerm();
         System.out.println(nodeId + ": starting election for term " + currentTerm);
         log.debug("{} Starting election for term: {}", nodeId, currentTerm);
@@ -281,8 +389,6 @@ public class RaftNode {
             future.thenAccept(response -> processVoteResponse(peerId, response))
                     .exceptionally(e -> {
                         log.debug("Error sending requestvote to {}", peerId, e);
-                        System.err
-                                .println(nodeId + " : Error sending RequestVote to " + peerId + ": " + e.getMessage());
                         return null;
                     });
         }
@@ -316,47 +422,52 @@ public class RaftNode {
     }
 
     private synchronized void processVoteResponse(String peerId, RequestVoteResponse response) {
-        int currentTerm = getCurrentTerm();
-        log.debug("{}: Processing vote from {} in term {} (my term: {}), granted: {}",
-                nodeId, peerId, response.getTerm(), currentTerm, response.isVoteGranted());
+        try {
+            int currentTerm = getCurrentTerm();
+            log.debug("{}: Processing vote from {} in term {} (my term: {}), granted: {}",
+                    nodeId, peerId, response.getTerm(), currentTerm, response.isVoteGranted());
 
-        if (state == RaftState.LEADER) {
-            log.debug("{} Ignoring vote from {} as we're already a leader", nodeId, peerId);
-            return;
-        }
-        // Ignore if no longer candidate or term doesn't match
-        if (state != RaftState.CANDIDATE) {
-            return;
-        }
-        // If responder has higher term, step down
-        if (response.getTerm() > currentTerm) {
-            log.info("{}: Stepping down due to higher term in vote response from {}", nodeId, peerId);
-            currentTerm = response.getTerm();
-            logManager.saveCurrentTerm(currentTerm);
-            logManager.saveVotedFor(null);
-            transitionTo(RaftState.FOLLOWER);
-            return;
-        }
-        if (response.getTerm() < currentTerm) {
-            return;
-        }
-        // Count vote if granted
-        if (response.isVoteGranted()) {
-            int votes = voteCount.incrementAndGet();
-            // int totalNodes = peerIds.size() + 1;
-            // int majority = (totalNodes / 2) + 1;
-            // log.info("{}: Received vote from {} in term {}, vote count: {}/{} for
-            // majority",
-            // nodeId, peerId, currentTerm, votes, majority);
-            // System.out.println(nodeId + ": vote count is now " + votes + "(need majority)
-            // + " + " for majority");
-            // If majority, become leader
-            if (hasMajority(votes)) {
-                transitionTo(RaftState.LEADER);
+            if (state == RaftState.LEADER) {
+                log.debug("{} Ignoring vote from {} as we're already a leader", nodeId, peerId);
+                return;
             }
-        } else {
-            log.debug("{}: Vote denied by {} in term {}", nodeId, peerId, currentTerm);
+            // Ignore if no longer candidate or term doesn't match
+            if (state != RaftState.CANDIDATE) {
+                return;
+            }
+            // If responder has higher term, step down
+            if (response.getTerm() > currentTerm) {
+                log.info("{}: Stepping down due to higher term in vote response from {}", nodeId, peerId);
+                currentTerm = response.getTerm();
+                logManager.saveCurrentTerm(currentTerm);
+                logManager.saveVotedFor(null);
+                transitionTo(RaftState.FOLLOWER);
+                return;
+            }
+            if (response.getTerm() < currentTerm) {
+                return;
+            }
+            // Count vote if granted
+            if (response.isVoteGranted()) {
+                int votes = voteCount.incrementAndGet();
+                // int totalNodes = peerIds.size() + 1;
+                // int majority = (totalNodes / 2) + 1;
+                // log.info("{}: Received vote from {} in term {}, vote count: {}/{} for
+                // majority",
+                // nodeId, peerId, currentTerm, votes, majority);
+                // System.out.println(nodeId + ": vote count is now " + votes + "(need majority)
+                // + " + " for majority");
+                // If majority, become leader
+                if (hasMajority(votes)) {
+                    transitionTo(RaftState.LEADER);
+                }
+            } else {
+                log.debug("{}: Vote denied by {} in term {}", nodeId, peerId, currentTerm);
+            }
+        } catch (Exception e) {
+            log.error("Error occurred in processVoteResponse", e);
         }
+
     }
 
     private boolean hasMajority(int votes) {
@@ -380,7 +491,7 @@ public class RaftNode {
      */
     private synchronized void becomeLeader() {
         int currentTerm = getCurrentTerm();
-        System.out.println(nodeId + " Becoming leader for term " + currentTerm);
+        log.info(" {} Becoming leader for term {}", nodeId, currentTerm);
         this.leaderId = nodeId;
         // Initializes nextIndex and matchIndex for all peers
         int nextIdx = logManager.getLastLogIndex() + 1;
@@ -399,105 +510,186 @@ public class RaftNode {
      * Send heartbeats(empty AppendEntries RPCs) to all peers
      */
     private void sendHeartBeats() {
-        int currentTerm = getCurrentTerm();
-        if (state != RaftState.LEADER) {
-            log.warn("{}: Attempted to send heartbeats while not LEADER (state: {})",
-                    nodeId, state);
-            return;
+        try {
+            int currentTerm = getCurrentTerm();
+            if (state != RaftState.LEADER) {
+                log.warn("{}: Attempted to send heartbeats while not LEADER (state: {})",
+                        nodeId, state);
+                return;
+            }
+            List<String> targetPeers;
+            if (!inJointConsensus) {
+                targetPeers = new ArrayList<>(peerIds);
+            } else {
+                targetPeers = new ArrayList<>();
+                for (String peer : newConfiguration) {
+                    if (!peer.equals(nodeId)) {
+                        targetPeers.add(peer);
+                    }
+                }
+            }
+            log.debug("sendHeartbeats newConfiguration: {}", newConfiguration);
+            log.debug("{}: Sending heartbeats to {} peers for term {}",
+                    nodeId, targetPeers, currentTerm);
+            List<String> allPeers = getPeersForVoting();
+            for (String peerId : targetPeers) {
+                try {
+                    sendAppendEntries(peerId);
+                } catch (Exception e) {
+                    log.error("{}: Error sending heartbeat to {}: {}", nodeId, peerId, e.getMessage(), e);
+                }
+
+            }
+        } catch (Exception e) {
+            log.error("Error: {} failed to send heartbeats ", nodeId, e);
         }
 
-        log.debug("{}: Sending heartbeats to {} peers for term {}",
-                nodeId, peerIds.size(), currentTerm);
-        List<String> allPeers = getPeersForVoting();
-        for (String peerId : allPeers) {
-            sendAppendEntries(peerId);
-        }
     }
 
     /**
      * Send AppendEntries RPC to a specific peer
      */
     private void sendAppendEntries(String peerId) {
+        try {
 
-        if (!nextIndex.containsKey(peerId)) {
-            int lastIdx = logManager.getLastLogIndex();
-            log.warn("{}: Adding missing nextIndex for {} to {}", nodeId, peerId, lastIdx + 1);
-            nextIndex.put(peerId, lastIdx + 1);
-            replicationIndex.put(peerId, 0);
+            if (state != RaftState.LEADER) {
+                log.warn("{}: sendAppendEntries called for {} while not leader (state: {})", nodeId, peerId, state);
+                return;
+            }
+            if (!nextIndex.containsKey(peerId)) {
+                int lastIdx = logManager.getLastLogIndex();
+                log.warn("{}: Adding missing nextIndex for {} to {}", nodeId, peerId, lastIdx + 1);
+                nextIndex.put(peerId, lastIdx + 1);
+                replicationIndex.put(peerId, 0);
+            }
+
+            int currentTerm = getCurrentTerm();
+            int prevLogIndex = nextIndex.get(peerId) - 1;
+            int prevLogTerm = prevLogIndex >= 0 ? logManager.getLogEntryTerm(prevLogIndex) : 0;
+            int peerNextIndex = nextIndex.get(peerId);
+
+            // Get entries to send
+            List<RaftLogEntry> entries = logManager.getEntriesFrom(nextIndex.get(peerId));
+            log.debug("{}: Sending {} commitIndex={} entries to {} starting at index {} (prevLogIndex={})",
+                    nodeId, entries.size(), commitIndex, peerId, peerNextIndex, prevLogIndex);
+            log.debug("Sending entries={} to node {}", entries, peerId);
+            // Create AppendEntriesRequest
+            AppendEntriesRequest request = new AppendEntriesRequest(currentTerm, nodeId, prevLogIndex, prevLogTerm,
+                    entries,
+                    commitIndex);
+            // Send RPC
+            CompletableFuture<AppendEntriesResponse> future = rpcService.sendAppendEntries(peerId, request);
+            future.thenAccept(response -> processAppendEntriesResponse(peerId, request, response))
+                    .exceptionally(e -> {
+                        log.error("{nodeId}: Error sending appendEntries to {peerId}", nodeId, peerId, e);
+                        // Record failure when rpc throws exception
+                        nodeFailureDetector.recordFailure(peerId);
+                        return null;
+                    });
+        } catch (Exception e) {
+            log.error("{}: Exception preparing AppendEntries for {}: {}", nodeId, peerId, e.getMessage());
+            nodeFailureDetector.recordFailure(peerId);
         }
 
-        int currentTerm = getCurrentTerm();
-        int prevLogIndex = nextIndex.get(peerId) - 1;
-        int prevLogTerm = prevLogIndex >= 0 ? logManager.getLogEntryTerm(prevLogIndex) : 0;
-        int peerNextIndex = nextIndex.get(peerId);
-
-        // Get entries to send
-        List<RaftLogEntry> entries = logManager.getEntriesFrom(nextIndex.get(peerId));
-        log.debug("{}: Sending {} entries to {} starting at index {} (prevLogIndex={})",
-                nodeId, entries.size(), peerId, peerNextIndex, prevLogIndex);
-        // Create AppendEntriesRequest
-        AppendEntriesRequest request = new AppendEntriesRequest(currentTerm, nodeId, prevLogIndex, prevLogTerm, entries,
-                commitIndex);
-        // Send RPC
-        CompletableFuture<AppendEntriesResponse> future = rpcService.sendAppendEntries(peerId, request);
-        future.thenAccept(response -> processAppendEntriesResponse(peerId, request, response))
-                .exceptionally(e -> {
-                    log.error("{nodeId}: Error sending appendEntries to {peerId}", nodeId, peerId, e);
-                    System.err.println(nodeId + ": Error sending appendentries to " + peerId + ": " + e.getMessage());
-                    return null;
-                });
     }
 
     private synchronized void processAppendEntriesResponse(String peerId, AppendEntriesRequest request,
             AppendEntriesResponse response) {
         // ignore if no longer leader or term doesn't match
-
-        // System.out.println("Leader: " + nodeId + " received appendEntries response
-        // from " + peerId);
-        // If responder has higher term, step down
-        int currentTerm = getCurrentTerm();
-        if (response.getTerm() > currentTerm) {
-            currentTerm = response.getTerm();
-            logManager.saveCurrentTerm(currentTerm);
-            logManager.saveVotedFor(null);
-            transitionTo(RaftState.FOLLOWER);
-            return;
-        }
-
-        if (state != RaftState.LEADER || currentTerm != request.getTerm()) {
-            return;
-        }
-        // Handle success/failure
-        if (response.isSuccess()) {
-            // update nextIndex and matchIndex for successful append entries
-            int newReplicationIndex = request.getPrevLogIndex() + request.getEntries().size();
-            nextIndex.put(peerId, newReplicationIndex + 1);
-            replicationIndex.put(peerId, newReplicationIndex);
-
-            // Check if we can advance commit index(later)
-            updateCommitIndex();
-
-        } else {
-            // Decrement nextIndex and retry
-            int oldNextIndex = nextIndex.get(peerId);
-            int newNextIndex = Math.max(0, oldNextIndex - 1);
-            nextIndex.put(peerId, newNextIndex);
-            log.info("{}: AppendEntries failed for {} - nextIndex: {} -> {} (prevLogIndex was {})",
-                    nodeId, peerId, oldNextIndex, newNextIndex, request.getPrevLogIndex());
-            if (newNextIndex == 0) {
-                log.info("{}: Sending entire log to {} from begining", nodeId, peerId);
+        try {
+            // If responder has higher term, step down
+            int currentTerm = getCurrentTerm();
+            if (response.getTerm() > currentTerm) {
+                currentTerm = response.getTerm();
+                logManager.saveCurrentTerm(currentTerm);
+                logManager.saveVotedFor(null);
+                transitionTo(RaftState.FOLLOWER);
+                return;
             }
-            // Retry immediately
-            CompletableFuture.runAsync(() -> {
-                try {
-                    Thread.sleep(10);
-                    sendAppendEntries(peerId);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+
+            if (state != RaftState.LEADER || currentTerm != request.getTerm()) {
+                return;
+            }
+            // Handle success/failure
+            if (response.isSuccess()) {
+                // Record successfull communication
+                nodeFailureDetector.recordSuccess(peerId);
+                // update nextIndex and matchIndex for successful append entries
+                int newReplicationIndex = request.getPrevLogIndex() + request.getEntries().size();
+                nextIndex.put(peerId, newReplicationIndex + 1);
+                replicationIndex.put(peerId, newReplicationIndex);
+
+                // Check if we can advance commit index(later)
+                updateCommitIndex();
+
+            } else {
+                // Record failed communication - But only for actual failures
+                // for simplicity we're catching all failures here
+                nodeFailureDetector.recordFailure(peerId);
+
+                if (!shouldReplicateToPeer(peerId)) {
+                    log.debug("{}: Not retrying for {} as it's no longer in the active configuration",
+                            nodeId, peerId);
+                    return;
                 }
-            });
-            // sendAppendEntries(peerId);
+                // Decrement nextIndex and retry
+                if (!nextIndex.containsKey(peerId)) {
+                    log.warn("{}: Peer {} no longer in nextIndex map after failed append. Ignoring.",
+                            nodeId, peerId);
+                    return;
+                }
+                int oldNextIndex = nextIndex.get(peerId);
+                int newNextIndex = Math.max(0, oldNextIndex - 1);
+                nextIndex.put(peerId, newNextIndex);
+                log.info("{}: AppendEntries failed for {} - nextIndex: {} -> {} (prevLogIndex was {})",
+                        nodeId, peerId, oldNextIndex, newNextIndex, request.getPrevLogIndex());
+                if (newNextIndex == 0) {
+                    log.info("{}: Sending entire log to {} from begining", nodeId, peerId);
+                }
+                // Retry immediately
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        Thread.sleep(10);
+                        if (state != RaftState.LEADER || !shouldReplicateToPeer(peerId)) {
+                            log.debug("{}: Skipping retry for {}, leader={}, should-replicate={}",
+                                    nodeId, peerId, state == RaftState.LEADER, shouldReplicateToPeer(peerId));
+                            return;
+                        }
+                        log.debug("{}: Retrying sendAppendEntries for {}", nodeId, peerId);
+
+                        sendAppendEntries(peerId);
+                    } catch (InterruptedException e) {
+                        log.debug("Retry thread interrupted", e);
+                        Thread.currentThread().interrupt();
+                    } catch (Exception e) {
+                        log.debug("Retry failed", e);
+                    }
+                });
+                // sendAppendEntries(peerId);
+            }
+        } catch (Exception e) {
+            log.error("Error: processAppendEntriesResponse", e);
         }
+
+    }
+
+    public boolean shouldReplicateToPeer(String peerId) {
+        if (!inJointConsensus) {
+            return peerIds.contains(peerId);
+        }
+        if (newConfiguration != null && newConfiguration.contains(peerId)) {
+            return true;
+        }
+
+        // Special case for joint consensus - during transition we still need to
+        // replicate to peers in old configuration until final is commiteed
+        if (oldConfiguration != null && oldConfiguration.contains(peerId)) {
+            if (nodeFailureDetector != null && nodeFailureDetector.isNodeConsideredFailed(peerId)) {
+                return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -514,26 +706,31 @@ public class RaftNode {
          * for n = 10; only 2 nodes have it (leader + 1 follower) => not majority
          * for n = 9; 3 nodes have it(leader+2 followers) => majority
          */
-        int currentTerm = getCurrentTerm();
-        System.out.println("Starting updateCommitIndex, current commitIndex=" + commitIndex);
-        for (int n = logManager.getLastLogIndex(); n > commitIndex; n--) {
-            System.out.println("Checking n=" + n);
-            // Only commit log entries from currentTerm
-            if (logManager.getLogEntryTerm(n) != currentTerm) {
-                continue;
-            }
+        try {
+            int currentTerm = getCurrentTerm();
+            System.out.println("Starting updateCommitIndex, current commitIndex=" + commitIndex);
+            for (int n = logManager.getLastLogIndex(); n > commitIndex; n--) {
+                System.out.println("Checking n=" + n);
+                // Only commit log entries from currentTerm
+                if (logManager.getLogEntryTerm(n) != currentTerm) {
+                    continue;
+                }
 
-            if (countNodesWithLogIndex(n) >= getMajoritySize()) {
-                // majority has this replicationIndex(n)
-                System.out.println("COMMITTING n=" + n);
-                commitIndex = n;
-                applyLogEntries();
-                break;
-            } else {
-                System.out.println("Not enough for majority at n=" + n);
+                if (countNodesWithLogIndex(n) >= getMajoritySize()) {
+                    // majority has this replicationIndex(n)
+                    System.out.println("COMMITTING n=" + n);
+                    commitIndex = n;
+                    applyLogEntries();
+                    break;
+                } else {
+                    System.out.println("Not enough for majority at n=" + n);
+                }
             }
+            log.info("Final commitIndex=" + commitIndex);
+        } catch (Exception e) {
+            log.error("Error: updateCommitIndex", e);
         }
-        System.out.println("Final commitIndex=" + commitIndex);
+
     }
 
     /**
@@ -600,6 +797,7 @@ public class RaftNode {
      * Applies log entries that have been committed but not yet applied
      */
     private void applyLogEntries() {
+        log.info("applyLogEntries called lastApplied: {}, commitIndex: {}", lastApplied, commitIndex);
         while (lastApplied < commitIndex) {
             lastApplied++;
             RaftLogEntry entry = logManager.getLogEntry(lastApplied);
@@ -607,10 +805,13 @@ public class RaftNode {
             // System.out.println(nodeId + ": Applied log entry " + lastApplied + ": " +
             // entry.getCommand());
             if (stateMachine != null) {
+
                 try {
                     String serialized = entry.getCommand();
+                    log.info("serialized command: {}", serialized);
                     StateMachineCommand command = null;
                     if (serialized.startsWith("CONFIG_CHANGE")) {
+                        log.info("Deserializing ConfigChangeCommand: {}", serialized);
                         command = ConfigChangeCommand.deserialize(serialized);
                         applyConfigChangeCommand((ConfigChangeCommand) command);
                     } else {
@@ -626,72 +827,86 @@ public class RaftNode {
                 } catch (Exception e) {
                     log.error("Error applying command at index: {}", lastApplied, e);
                 }
+            } else {
+                log.warn("StateMachine is null", stateMachine);
             }
         }
     }
 
     private void applyConfigChangeCommand(ConfigChangeCommand command) {
-        ConfigChangeType type = command.getType();
-        if (type == ConfigChangeType.JOINT) {
-            // Enter joint consensus
-            log.info("{}: Entering joint consensus - old: {}, new: {}", nodeId, command.getOldConfig(),
-                    command.getNewConfig());
-            oldConfiguration = new ArrayList<>(command.getOldConfig());
-            newConfiguration = new ArrayList<>(command.getNewConfig());
-            inJointConsensus = true;
+        try {
+            ConfigChangeType type = command.getType();
+            if (type == ConfigChangeType.JOINT) {
+                // Enter joint consensus
+                log.info("{}: Entering joint consensus - old: {}, new: {}", nodeId, command.getOldConfig(),
+                        command.getNewConfig());
+                oldConfiguration = new ArrayList<>(command.getOldConfig());
+                newConfiguration = new ArrayList<>(command.getNewConfig());
+                inJointConsensus = true;
 
-            // A new node becomes caught up when it sees the joint consensus entry
-            if (isJoining && newConfiguration.contains(nodeId) && !oldConfiguration.contains(nodeId)) {
-                log.info("{}: node is now caught up and part of joint configuration", nodeId);
-                isCaughtUp = true;
-            }
-            // if we're the leader update nextIndex and replciationIndex for any new peers
-            if (state == RaftState.LEADER) {
-                int nextIdx = logManager.getLastLogIndex() + 1;
-                for (String peerId : newConfiguration) {
-                    if (!peerId.equals(nodeId) && !oldConfiguration.contains(peerId)
-                            && !nextIndex.containsKey(peerId)) {
-                        log.info("{}: Initializing nextIndex for new peer {} to {}", nodeId, peerId, nextIdx);
+                // A new node becomes caught up when it sees the joint consensus entry
+                if (isJoining && newConfiguration.contains(nodeId) && !oldConfiguration.contains(nodeId)) {
+                    log.info("{}: node is now caught up and part of joint configuration", nodeId);
+                    isCaughtUp = true;
+                }
+                // if we're the leader update nextIndex and replciationIndex for any new peers
+                if (state == RaftState.LEADER) {
+                    int nextIdx = logManager.getLastLogIndex() + 1;
+                    for (String peerId : newConfiguration) {
+                        if (!peerId.equals(nodeId) && !oldConfiguration.contains(peerId)) {
+                            log.info("{}: Initializing nextIndex for new peer {} to {}", nodeId, peerId, nextIdx);
+                            if (!nextIndex.containsKey(peerId)) {
+                                nextIndex.put(peerId, nextIdx);
+                                replicationIndex.put(peerId, 0);
+                            }
+                        }
+
+                    }
+                    for (String peerId : oldConfiguration) {
+                        if (!newConfiguration.contains(peerId)) {
+                            log.info("{}: Removing replication state for peer {} being removed in joint consensus",
+                                    nodeId, peerId);
+                            nextIndex.remove(peerId);
+                            replicationIndex.remove(peerId);
+                        }
+                    }
+                }
+            } else if (type == ConfigChangeType.FINAL) {
+                log.info("{}: switching to final configuration: {}", nodeId, command.getNewConfig());
+
+                // update peer list
+                List<String> newPeers = new ArrayList<>();
+                for (String peer : command.getNewConfig()) {
+                    if (!peer.equals(nodeId)) {
+                        newPeers.add(peer);
+                    }
+                }
+                this.peerIds = newPeers;
+                this.inJointConsensus = false;
+                this.oldConfiguration = null;
+                this.newConfiguration = null;
+
+                // if this node was joining and is now in final configuration
+                // it's done joining
+                if (isJoining && command.getNewConfig().contains(nodeId)) {
+                    log.info("{}: node successfully joined in final configuration", nodeId);
+                    isJoining = false;
+                }
+                // if we're the leader update nextIndex and replciationIndex for any new peers
+                if (state == RaftState.LEADER) {
+                    int nextIdx = logManager.getLastLogIndex() + 1;
+                    for (String peerId : peerIds) {
                         if (!nextIndex.containsKey(peerId)) {
                             nextIndex.put(peerId, nextIdx);
                             replicationIndex.put(peerId, 0);
                         }
                     }
-
                 }
             }
-        } else if (type == ConfigChangeType.FINAL) {
-            log.info("{}: switching to final configuration: {}", nodeId, command.getNewConfig());
-
-            // update peer list
-            List<String> newPeers = new ArrayList<>();
-            for (String peer : command.getNewConfig()) {
-                if (!peer.equals(nodeId)) {
-                    newPeers.add(peer);
-                }
-            }
-            this.peerIds = newPeers;
-            this.inJointConsensus = false;
-            this.oldConfiguration = null;
-            this.newConfiguration = null;
-
-            // if this node was joining and is now in final configuration
-            // it's done joining
-            if (isJoining && command.getNewConfig().contains(nodeId)) {
-                log.info("{}: node successfully joined in final configuration", nodeId);
-                isJoining = false;
-            }
-            // if we're the leader update nextIndex and replciationIndex for any new peers
-            if (state == RaftState.LEADER) {
-                int nextIdx = logManager.getLastLogIndex() + 1;
-                for (String peerId : peerIds) {
-                    if (!nextIndex.containsKey(peerId)) {
-                        nextIndex.put(peerId, nextIdx);
-                        replicationIndex.put(peerId, 0);
-                    }
-                }
-            }
+        } catch (Exception e) {
+            log.error("Error: applyConfigChangeCommand", e);
         }
+
     }
 
     /**
@@ -722,7 +937,13 @@ public class RaftNode {
             String serialized = command.serialize();
             log.debug("Applying command {} to {} ", serialized, nodeId);
             int index = logManager.append(currentTerm, serialized);
-            log.info("{}: Append command at index {}", nodeId, index);
+            boolean isConfigChange = command instanceof ConfigChangeCommand;
+            if (isConfigChange) {
+                ConfigChangeCommand configCmd = (ConfigChangeCommand) command;
+                log.info("{}: Locally applying config change immediately on leader: {}",
+                        nodeId, configCmd.getType());
+                applyConfigChangeCommand(configCmd);
+            }
             // replicate to followers immediately
             sendHeartBeats();
             return true;

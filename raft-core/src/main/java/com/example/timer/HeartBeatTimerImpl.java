@@ -5,6 +5,9 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
 public class HeartBeatTimerImpl implements HeartBeatTimer {
     private final ScheduledExecutorService scheduler;
     private final int heartbeatIntervalMs;
@@ -26,7 +29,7 @@ public class HeartBeatTimerImpl implements HeartBeatTimer {
             throw new IllegalStateException("Heartbeat handler not set");
         }
         stop();
-        System.out.println("HeartbeatTimer: Starting with interval " + heartbeatIntervalMs + "ms");
+        log.info("HeartbeatTimer: Starting with interval " + heartbeatIntervalMs + "ms");
         // Schedule heartbeats at fixed rate
         scheduledTask = scheduler.scheduleWithFixedDelay(this::triggerHeartbeat, 0, heartbeatIntervalMs,
                 TimeUnit.MILLISECONDS);
@@ -35,7 +38,7 @@ public class HeartBeatTimerImpl implements HeartBeatTimer {
     @Override
     public void stop() {
         if (scheduledTask != null) {
-            System.out.println("HeartbeatTimer: Stopping");
+            log.info("HeartbeatTimer: Stopping");
             scheduledTask.cancel(false);
             scheduledTask = null;
         }
@@ -47,7 +50,7 @@ public class HeartBeatTimerImpl implements HeartBeatTimer {
     }
 
     private void triggerHeartbeat() {
-        System.out.println("HeartbeatTimer: Triggering heartbeat");
+        log.info("HeartbeatTimer: Triggering heartbeat");
         Runnable handler;
         synchronized (this) {
             handler = heartbeatHander;

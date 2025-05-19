@@ -60,7 +60,7 @@ public class HttpRaftRpcService implements RaftRpcService {
                 return response;
             } catch (ResourceAccessException e) {
                 log.warn("Failed to send AppendEntries: {}, {}", targetNodeId, e.getMessage());
-                return new AppendEntriesResponse(0, false);
+                return new AppendEntriesResponse(request.getTerm(), false);
             } catch (Exception e) {
                 log.error("Error sending AppendEntries: {}, {}", targetNodeId, e.getMessage());
                 throw e;
